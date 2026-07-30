@@ -1,0 +1,207 @@
+name: Android OpenJDK 21
+
+# Task B2 (design D2/D7, tasks doc Phase B). Near-verbatim port of
+# feeldev12/launcher's own .github/workflows/android-jdk21.yml, moved into
+# its own dedicated public repo per design D2 (two separate repos, not one
+# shared repo) — see this repo's README for why.
+#
+# We build our OWN OpenJDK 21 for Android from source, per-ABI, in CI. We do
+# NOT redistribute AngelAuraMC's built JRE artifact — we build ours from the
+# same upstream OpenJDK source using their build *recipe* (checked out below,
+# pinned to a specific commit) as the reference/fork point. GPLv2 §3
+# source-correspondence is satisfied because we hold and build from the
+# source ourselves (design D7), instead of hotlinking or re-publishing
+# someone else's compiled output.
+#
+# Reference / fork source (unchanged from the original workflow):
+#   repo:   AngelAuraMC/angelauramc-openjdk-build
+#   branch: buildjre17-21
+#   pinned commit: 4527b5a73dcf3f890b45eab4c6a91651ea28a5ea (2026-07-09)
+#
+# NOTE: the reference repo's own build-script tree has no LICENSE file
+# (distinct from the OpenJDK source itself, which is cleanly GPLv2+CE). Treat
+# these scripts as a working reference to build from, not as a redistributable
+# dependency in their own right.
+#
+# CHANGES FROM THE ORIGINAL (this port, task B2):
+#   - Dropped both "Checkout nerion (this repo)" steps — re-verified this
+#     phase that the build never actually uses app-launcher source (build job
+#     only uses the pinned reference-build checkout; publish-manifest job
+#     only consumes downloaded artifacts).
+#   - Swapped the cross-repo publish (repository: feeldev12/nerion-updates +
+#     secrets.UPDATER_TOKEN) for an in-repo publish using this repo's own
+#     GITHUB_TOKEN (permissions: contents: write) — this repo IS the public
+#     target now, no cross-repo hop needed.
+#   - release_base inside the manifest generator repointed at this repo.
+#   - Tag (jre21-android) and cron cadence kept identical.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/jre21-android.yml'
+  schedule:
+    - cron: '0 3 1 */2 *'
+
+permissions:
+  contents: write
+
+env:
+  REFERENCE_REPO: AngelAuraMC/angelauramc-openjdk-build
+  REFERENCE_REF: 4527b5a73dcf3f890b45eab4c6a91651ea28a5ea
+  TARGET_VERSION: 21
+
+jobs:
+  build:
+    name: "Build OpenJDK 21 for Android ${{ matrix.abi }}"
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [aarch64, aarch32, x86, x86_64]
+
+    steps:
+      - name: Checkout reference build recipe (pinned commit)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REFERENCE_REPO }}
+          ref: ${{ env.REFERENCE_REF }}
+          path: reference-build
+
+      - name: Set up JDK 21 (build toolchain — bootstraps the cross-build itself)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install autoconf python3 python-is-python3 unzip zip \
+            systemtap-sdt-dev libxtst-dev libasound2-dev libelf-dev \
+            libfontconfig1-dev libx11-dev libxext-dev libxrandr-dev \
+            libxrender-dev libxtst-dev libxt-dev
+
+      - name: Build OpenJDK 21 for ${{ matrix.abi }}
+        working-directory: reference-build
+        run: |
+          export TARGET_VERSION=${{ env.TARGET_VERSION }}
+          bash "1_ci_build_arch_${{ matrix.abi }}.sh"
+
+      - name: Compute sha256 (JreBundle contract — see app-launcher's commands/java.rs)
+        working-directory: reference-build
+        run: |
+          set -euo pipefail
+          jdk_archive=$(ls jdk${{ env.TARGET_VERSION }}-android*.tar.xz)
+          jre_archive=$(ls jre${{ env.TARGET_VERSION }}-android*.tar.xz)
+          sha256sum "$jdk_archive" > "$jdk_archive.sha256"
+          sha256sum "$jre_archive" > "$jre_archive.sha256"
+          echo "JDK_ARCHIVE=$jdk_archive" >> "$GITHUB_ENV"
+          echo "JRE_ARCHIVE=$jre_archive" >> "$GITHUB_ENV"
+
+      - name: Upload JDK build output (our own build, not AngelAuraMC's)
+        uses: actions/upload-artifact@v4
+        with:
+          name: "nerion-jdk21-${{ matrix.abi }}"
+          path: |
+            reference-build/${{ env.JDK_ARCHIVE }}
+            reference-build/${{ env.JDK_ARCHIVE }}.sha256
+
+      - name: Upload JRE build output (our own build, not AngelAuraMC's)
+        uses: actions/upload-artifact@v4
+        with:
+          name: "nerion-jre21-${{ matrix.abi }}"
+          path: |
+            reference-build/${{ env.JRE_ARCHIVE }}
+            reference-build/${{ env.JRE_ARCHIVE }}.sha256
+
+  publish-manifest:
+    name: Publish JreManifest
+    needs: build
+    runs-on: ubuntu-22.04
+    # This repo IS the public target now (design D2) — no cross-repo hop to
+    # feeldev12/nerion-updates needed, unlike the original workflow this was
+    # ported from (that repo, feeldev12/launcher, is private, so its own
+    # release asset URLs are not publicly fetchable).
+    env:
+      RELEASE_TAG: jre21-android
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Download all JRE artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 'nerion-jre21-*'
+          path: artifacts
+
+      - name: Build JreManifest JSON
+        # Shape matches app-launcher's commands/java.rs JreManifest/JreBundle
+        # structs, unchanged by this port.
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+
+          abi_map = {
+              "aarch32": "Armv7",
+              "aarch64": "Arm64",
+              "x86": "X86",
+              "x86_64": "X86_64",
+          }
+          release_tag = "${{ env.RELEASE_TAG }}"
+          release_base = f"https://github.com/feeldev12/nerion-android-jdk-build/releases/download/{release_tag}"
+
+          bundles = []
+          for ci_abi, enum_variant in abi_map.items():
+              archive_dir = pathlib.Path("artifacts") / f"nerion-jre21-{ci_abi}"
+              archives = list(archive_dir.glob("jre21-android*.tar.xz"))
+              if not archives:
+                  continue
+              archive = archives[0]
+              sha256_file = archive.with_suffix(archive.suffix + ".sha256")
+              sha256 = sha256_file.read_text().split()[0] if sha256_file.exists() else hashlib.sha256(archive.read_bytes()).hexdigest()
+              bundles.append({
+                  "java_version": "21",
+                  "abi": enum_variant,
+                  "download_url": f"{release_base}/{archive.name}",
+                  "sha256": sha256,
+              })
+
+          manifest = {
+              "java_version": "21",
+              "build_id": "${{ github.run_id }}",
+              "bundles": bundles,
+          }
+          pathlib.Path("jre21-manifest.json").write_text(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Upload JreManifest (CI artifact, kept for debugging/history)
+        uses: actions/upload-artifact@v4
+        with:
+          name: nerion-jre21-manifest
+          path: jre21-manifest.json
+
+      - name: Publish JRE manifest + archives to a stable public GitHub Release
+        # In-repo publish (this repo is public) using the built-in
+        # GITHUB_TOKEN — no cross-repo token/secret needed, unlike the
+        # original workflow this was ported from. Re-running this job
+        # re-uploads to the SAME tag, replacing assets in place
+        # (softprops/action-gh-release updates an existing release's assets
+        # rather than failing on tag collision).
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "Android OpenJDK 21 JRE bundles"
+          body: |
+            Self-built OpenJDK 21 Android JRE bundles — one per supported ABI,
+            plus the JreManifest these bundles are described by. Published by
+            this repo's own `.github/workflows/jre21-android.yml`
+            (run ${{ github.run_id }}). Ported from
+            feeldev12/launcher's original android-jdk21.yml (task B2).
+          draft: false
+          prerelease: false
+          files: |
+            jre21-manifest.json
+            artifacts/**/*.tar.xz
+            artifacts/**/*.tar.xz.sha256
