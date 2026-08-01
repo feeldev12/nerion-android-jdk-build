@@ -1,0 +1,204 @@
+name: Android OpenJDK 17
+
+# Phase 1 (design REV2 android-jdk-1725-build-pipeline, tasks 1.1). Sibling of
+# jre21-android.yml, same reference branch/commit — that branch already
+# builds both 17 and 21 from the same script tree, keyed off TARGET_VERSION.
+#
+# We build our OWN OpenJDK 17 for Android from source, per-ABI, in CI. We do
+# NOT redistribute AngelAuraMC's built JRE artifact — we build ours from the
+# same upstream OpenJDK source using their build *recipe* (checked out below,
+# pinned to a specific commit) as the reference/fork point. GPLv2 §3
+# source-correspondence is satisfied because we hold and build from the
+# source ourselves, instead of hotlinking or re-publishing someone else's
+# compiled output.
+#
+# Reference / fork source (same commit as jre21-android.yml — this branch
+# builds both 17 and 21 depending on TARGET_VERSION):
+#   repo:   AngelAuraMC/angelauramc-openjdk-build
+#   branch: buildjre17-21
+#   pinned commit: 4527b5a73dcf3f890b45eab4c6a91651ea28a5ea (2026-07-09)
+#
+# NOTE: the reference repo's own build-script tree has no LICENSE file
+# (distinct from the OpenJDK source itself, which is cleanly GPLv2+CE). Treat
+# these scripts as a working reference to build from, not as a redistributable
+# dependency in their own right.
+#
+# Bootstrap JDK: Temurin 17 (NOT 21 — REVERTED after a real CI run proved the
+# "reuse 21" assumption wrong). `jlink` enforces that its own runtime version
+# matches the `java.base` module version it links into the final image —
+# building java.base 17 with a Temurin 21 boot JDK fails with:
+#   "Error: jlink version 21.0 does not match target java.base version 17.0"
+# confirmed via a real GitHub Actions run (all 4 ABIs failed identically)
+# before this fix. The build *script* being version-parameterized (keying off
+# $TARGET_VERSION) does not make the *bootstrap toolchain* version-agnostic —
+# those are two different things. Standard practice for building any JDK N
+# from source is bootstrapping with JDK N or N-1; 17 is used here (matching
+# the target exactly) since that's what's proven to work.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/jre17-android.yml'
+  schedule:
+    - cron: '0 3 1 */2 *'
+
+permissions:
+  contents: write
+
+env:
+  REFERENCE_REPO: AngelAuraMC/angelauramc-openjdk-build
+  REFERENCE_REF: 4527b5a73dcf3f890b45eab4c6a91651ea28a5ea
+  TARGET_VERSION: 17
+
+jobs:
+  build:
+    name: "Build OpenJDK 17 for Android ${{ matrix.abi }}"
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [aarch64, aarch32, x86, x86_64]
+
+    steps:
+      - name: Checkout reference build recipe (pinned commit)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REFERENCE_REPO }}
+          ref: ${{ env.REFERENCE_REF }}
+          path: reference-build
+
+      - name: Set up JDK 17 (build toolchain — bootstraps the JDK 17 cross-build)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install autoconf python3 python-is-python3 unzip zip \
+            systemtap-sdt-dev libxtst-dev libasound2-dev libelf-dev \
+            libfontconfig1-dev libx11-dev libxext-dev libxrandr-dev \
+            libxrender-dev libxtst-dev libxt-dev
+
+      - name: Build OpenJDK 17 for ${{ matrix.abi }}
+        working-directory: reference-build
+        run: |
+          export TARGET_VERSION=${{ env.TARGET_VERSION }}
+          bash "1_ci_build_arch_${{ matrix.abi }}.sh"
+
+      - name: Compute sha256 (JreBundle contract — see app-launcher's commands/java.rs)
+        working-directory: reference-build
+        run: |
+          set -euo pipefail
+          jdk_archive=$(ls jdk${{ env.TARGET_VERSION }}-android*.tar.xz)
+          jre_archive=$(ls jre${{ env.TARGET_VERSION }}-android*.tar.xz)
+          sha256sum "$jdk_archive" > "$jdk_archive.sha256"
+          sha256sum "$jre_archive" > "$jre_archive.sha256"
+          echo "JDK_ARCHIVE=$jdk_archive" >> "$GITHUB_ENV"
+          echo "JRE_ARCHIVE=$jre_archive" >> "$GITHUB_ENV"
+
+      - name: Upload JDK build output (our own build, not AngelAuraMC's)
+        uses: actions/upload-artifact@v4
+        with:
+          name: "nerion-jdk17-${{ matrix.abi }}"
+          path: |
+            reference-build/${{ env.JDK_ARCHIVE }}
+            reference-build/${{ env.JDK_ARCHIVE }}.sha256
+
+      - name: Upload JRE build output (our own build, not AngelAuraMC's)
+        uses: actions/upload-artifact@v4
+        with:
+          name: "nerion-jre17-${{ matrix.abi }}"
+          path: |
+            reference-build/${{ env.JRE_ARCHIVE }}
+            reference-build/${{ env.JRE_ARCHIVE }}.sha256
+
+  publish-manifest:
+    name: Publish JreManifest
+    needs: build
+    runs-on: ubuntu-22.04
+    # This repo IS the public target (design D2) — in-repo publish via the
+    # built-in GITHUB_TOKEN, same as jre21-android.yml.
+    env:
+      RELEASE_TAG: jre17-android
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Download all JRE artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 'nerion-jre17-*'
+          path: artifacts
+
+      - name: Build JreManifest JSON
+        # Shape matches app-launcher's commands/java.rs JreManifest/JreBundle
+        # structs, unchanged from jre21-android.yml. Full 4-ABI matrix, same
+        # as jre21 (design A4 — only jre25 drops x86).
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+
+          abi_map = {
+              "aarch32": "Armv7",
+              "aarch64": "Arm64",
+              "x86": "X86",
+              "x86_64": "X86_64",
+          }
+          release_tag = "${{ env.RELEASE_TAG }}"
+          release_base = f"https://github.com/feeldev12/nerion-android-jdk-build/releases/download/{release_tag}"
+
+          bundles = []
+          for ci_abi, enum_variant in abi_map.items():
+              archive_dir = pathlib.Path("artifacts") / f"nerion-jre17-{ci_abi}"
+              archives = list(archive_dir.glob("jre17-android*.tar.xz"))
+              if not archives:
+                  continue
+              archive = archives[0]
+              sha256_file = archive.with_suffix(archive.suffix + ".sha256")
+              sha256 = sha256_file.read_text().split()[0] if sha256_file.exists() else hashlib.sha256(archive.read_bytes()).hexdigest()
+              bundles.append({
+                  "java_version": "17",
+                  "abi": enum_variant,
+                  "download_url": f"{release_base}/{archive.name}",
+                  "sha256": sha256,
+              })
+
+          manifest = {
+              "java_version": "17",
+              "build_id": "${{ github.run_id }}",
+              "bundles": bundles,
+          }
+          pathlib.Path("jre17-manifest.json").write_text(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Upload JreManifest (CI artifact, kept for debugging/history)
+        uses: actions/upload-artifact@v4
+        with:
+          name: nerion-jre17-manifest
+          path: jre17-manifest.json
+
+      - name: Publish JRE manifest + archives to a stable public GitHub Release
+        # Re-running this job re-uploads to the SAME tag, replacing assets in
+        # place (softprops/action-gh-release updates an existing release's
+        # assets rather than failing on tag collision).
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "Android OpenJDK 17 JRE bundles"
+          body: |
+            Self-built OpenJDK 17 Android JRE bundles — one per supported ABI,
+            plus the JreManifest these bundles are described by. Published by
+            this repo's own `.github/workflows/jre17-android.yml`
+            (run ${{ github.run_id }}). Built from the same
+            AngelAuraMC/angelauramc-openjdk-build `buildjre17-21` reference
+            commit as jre21-android.yml.
+          draft: false
+          prerelease: false
+          files: |
+            jre17-manifest.json
+            artifacts/**/*.tar.xz
+            artifacts/**/*.tar.xz.sha256
