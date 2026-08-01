@@ -23,12 +23,17 @@ name: Android OpenJDK 17
 # these scripts as a working reference to build from, not as a redistributable
 # dependency in their own right.
 #
-# Bootstrap JDK: Temurin 21 (NOT 17) — same boot toolchain as jre21-android.yml.
-# This branch/commit has no --with-boot-jdk override for the Android build
-# path (5_clonejdk.sh/6_buildjdk.sh key off $TARGET_VERSION for the JDK
-# *source* being built, independent of whichever JDK runs `./configure` and
-# `make`), so reusing the already-proven Temurin 21 boot toolchain for the
-# 17 target is a no-op change to the working recipe.
+# Bootstrap JDK: Temurin 17 (NOT 21 — REVERTED after a real CI run proved the
+# "reuse 21" assumption wrong). `jlink` enforces that its own runtime version
+# matches the `java.base` module version it links into the final image —
+# building java.base 17 with a Temurin 21 boot JDK fails with:
+#   "Error: jlink version 21.0 does not match target java.base version 17.0"
+# confirmed via a real GitHub Actions run (all 4 ABIs failed identically)
+# before this fix. The build *script* being version-parameterized (keying off
+# $TARGET_VERSION) does not make the *bootstrap toolchain* version-agnostic —
+# those are two different things. Standard practice for building any JDK N
+# from source is bootstrapping with JDK N or N-1; 17 is used here (matching
+# the target exactly) since that's what's proven to work.
 
 on:
   workflow_dispatch:
@@ -63,10 +68,10 @@ jobs:
           ref: ${{ env.REFERENCE_REF }}
           path: reference-build
 
-      - name: Set up JDK 21 (build toolchain — bootstraps the JDK 17 cross-build)
+      - name: Set up JDK 17 (build toolchain — bootstraps the JDK 17 cross-build)
         uses: actions/setup-java@v4
         with:
-          java-version: '21'
+          java-version: '17'
           distribution: temurin
 
       - name: Install build dependencies
