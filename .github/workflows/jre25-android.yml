@@ -1,8 +1,7 @@
 name: Android OpenJDK 25
 
 # Phase 1 (design REV2 android-jdk-1725-build-pipeline, tasks 1.2). Sibling of
-# jre21-android.yml/jre17-android.yml, on a separate reference branch/commit
-# that extends the same recipe with a JDK 25 target.
+# jre21-android.yml/jre17-android.yml.
 #
 # We build our OWN OpenJDK 25 for Android from source, per-ABI, in CI. We do
 # NOT redistribute AngelAuraMC's built JRE artifact — we build ours from the
@@ -12,22 +11,50 @@ name: Android OpenJDK 25
 # source ourselves, instead of hotlinking or re-publishing someone else's
 # compiled output.
 #
-# Reference / fork source:
+# Reference / fork source — REVISED after a real CI failure on the original
+# pick. `judge/buildjre17-21-25`'s jdk25 patch (jdk25u_android.diff) adds a
+# `libtinyiconv` Android iconv shim but never wires it into ANY consumer's
+# Lib.gmk (java.instrument/jdk.jdwp.agent/jdk.hotspot.agent all failed to
+# link with "undefined symbol: iconv_open" on a real run). Traced the ACTUAL
+# working recipe instead: AngelAuraMC's own real, live `download_jre25`
+# release (github.com/AngelAuraMC/angelauramc-openjdk-build/releases/tag/download_jre25)
+# states in its own release notes it was built from
+# github.com/AngelAuraMC/angelauramc-openjdk-build/actions/runs/23901738803,
+# credited to FCL. Confirmed via that exact run's metadata
+# (`gh api .../actions/runs/23901738803`): head_branch
+# `fcl/BUILD_JRE_25`, head_sha `f20acbd396601f88510ed98b7ac165c4e8c50730`,
+# conclusion `success`. That branch's `jdk25u_android.diff` DOES patch all
+# three consumer Lib.gmk files. This is the proven-working recipe, not judge's.
 #   repo:   AngelAuraMC/angelauramc-openjdk-build
-#   branch: judge/buildjre17-21-25
-#   pinned commit: 4ed3485c42cac45c8e5db66c7284ef0c9501827f (2025-12-28)
+#   branch: fcl/BUILD_JRE_25
+#   pinned commit: f20acbd396601f88510ed98b7ac165c4e8c50730 (the exact commit
+#     that produced the real, live download_jre25 release assets)
 #
 # NOTE: the reference repo's own build-script tree has no LICENSE file
 # (distinct from the OpenJDK source itself, which is cleanly GPLv2+CE). Treat
 # these scripts as a working reference to build from, not as a redistributable
 # dependency in their own right.
 #
-# Bootstrap JDK: Temurin 25 (NOT 21) — design A3: JDK 25 needs a boot JDK of
-# N-1/N, reusing Temurin 21 (fine for the 17/21 target) is not safe here.
+# Bootstrap JDK: NONE configured here, deliberately. This branch's own
+# `ci_build_global.sh` → `get_boot_jdk.sh` downloads Oracle JDK 24.0.2 itself
+# (`wget https://download.oracle.com/java/24/archive/jdk-24.0.2_linux-x64_bin.tar.gz`)
+# as part of the build — self-contained, confirmed by reading that exact
+# script at the pinned commit. An external `actions/setup-java` step is not
+# just unnecessary but would fight this branch's own toolchain management.
+# Same story for apt build deps and the Android NDK itself — `ci_build_global.sh`
+# installs both internally (apt-get for the usual X11/audio/font dev headers,
+# then `wget`'s the NDK zip directly from dl.google.com). None of that needs
+# to be duplicated in this workflow.
 #
-# ABI matrix: aarch32/aarch64/x86_64 only, NO x86 — design A4: upstream JDK 25
-# dropped the 32-bit x86 Android target (confirmed independently against this
-# reference branch's own patches/ tree, which has no jre_25 32-bit x86 path).
+# ABI matrix: aarch32/aarch64/x86_64 only, NO x86 — matches this exact proven
+# recipe's own matrix (its `build.yml` never had an x86 leg for 25 at all).
+#
+# Output filename: this recipe's `tar_jdk.sh` produces
+# `jre25-${TARGET_SHORT}-<build-date>-release.tar.xz` (date-stamped, no
+# "android" in the name) — NOT our own `jre{N}-android-{abi}.tar.xz`
+# convention. Renamed post-build (see "Normalize output filename" step) so
+# our shared publish-manifest Python script (same glob pattern as
+# jre21/17/8) needs no jre25-specific special-casing.
 
 on:
   workflow_dispatch:
@@ -42,8 +69,7 @@ permissions:
 
 env:
   REFERENCE_REPO: AngelAuraMC/angelauramc-openjdk-build
-  REFERENCE_REF: 4ed3485c42cac45c8e5db66c7284ef0c9501827f
-  TARGET_VERSION: 25
+  REFERENCE_REF: f20acbd396601f88510ed98b7ac165c4e8c50730
 
 jobs:
   build:
@@ -62,44 +88,19 @@ jobs:
           ref: ${{ env.REFERENCE_REF }}
           path: reference-build
 
-      - name: Set up JDK 25 (build toolchain — bootstraps the JDK 25 cross-build)
-        uses: actions/setup-java@v4
-        with:
-          java-version: '25'
-          distribution: temurin
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get -y install autoconf python3 python-is-python3 unzip zip \
-            systemtap-sdt-dev libxtst-dev libasound2-dev libelf-dev \
-            libfontconfig1-dev libx11-dev libxext-dev libxrandr-dev \
-            libxrender-dev libxtst-dev libxt-dev
-
       - name: Build OpenJDK 25 for ${{ matrix.abi }}
         working-directory: reference-build
-        run: |
-          export TARGET_VERSION=${{ env.TARGET_VERSION }}
-          bash "1_ci_build_arch_${{ matrix.abi }}.sh"
+        run: bash "ci_build_arch_${{ matrix.abi }}.sh"
 
-      - name: Compute sha256 (JreBundle contract — see app-launcher's commands/java.rs)
+      - name: Normalize output filename + compute sha256 (JreBundle contract — see app-launcher's commands/java.rs)
         working-directory: reference-build
         run: |
           set -euo pipefail
-          jdk_archive=$(ls jdk${{ env.TARGET_VERSION }}-android*.tar.xz)
-          jre_archive=$(ls jre${{ env.TARGET_VERSION }}-android*.tar.xz)
-          sha256sum "$jdk_archive" > "$jdk_archive.sha256"
+          src_archive=$(ls jre25-*.tar.xz)
+          jre_archive="jre25-android-${{ matrix.abi }}.tar.xz"
+          mv "$src_archive" "$jre_archive"
           sha256sum "$jre_archive" > "$jre_archive.sha256"
-          echo "JDK_ARCHIVE=$jdk_archive" >> "$GITHUB_ENV"
           echo "JRE_ARCHIVE=$jre_archive" >> "$GITHUB_ENV"
-
-      - name: Upload JDK build output (our own build, not AngelAuraMC's)
-        uses: actions/upload-artifact@v4
-        with:
-          name: "nerion-jdk25-${{ matrix.abi }}"
-          path: |
-            reference-build/${{ env.JDK_ARCHIVE }}
-            reference-build/${{ env.JDK_ARCHIVE }}.sha256
 
       - name: Upload JRE build output (our own build, not AngelAuraMC's)
         uses: actions/upload-artifact@v4
@@ -129,11 +130,10 @@ jobs:
 
       - name: Build JreManifest JSON
         # Shape matches app-launcher's commands/java.rs JreManifest/JreBundle
-        # structs. abi_map intentionally has only 3 entries (no x86) — design
-        # A4/A6: jre25 has no x86 build leg, and the existing
-        # `if not archives: continue` skip-missing pattern already tolerates
-        # a shorter map, so bundle_for(X86) correctly returns None downstream
-        # without any assertion needing removal.
+        # structs. abi_map intentionally has only 3 entries (no x86) — the
+        # existing `if not archives: continue` skip-missing pattern already
+        # tolerates a shorter map, so bundle_for(X86) correctly returns None
+        # downstream without any assertion needing removal.
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -187,12 +187,13 @@ jobs:
           name: "Android OpenJDK 25 JRE bundles"
           body: |
             Self-built OpenJDK 25 Android JRE bundles — aarch32/aarch64/x86_64
-            only (no x86 — upstream JDK 25 dropped 32-bit x86), plus the
-            JreManifest these bundles are described by. Published by this
-            repo's own `.github/workflows/jre25-android.yml`
+            only (no x86 — this exact reference recipe never had an x86 leg
+            for 25), plus the JreManifest these bundles are described by.
+            Published by this repo's own `.github/workflows/jre25-android.yml`
             (run ${{ github.run_id }}). Built from
-            AngelAuraMC/angelauramc-openjdk-build's `judge/buildjre17-21-25`
-            reference commit.
+            AngelAuraMC/angelauramc-openjdk-build's `fcl/BUILD_JRE_25`
+            reference commit — the same commit that produced the upstream
+            repo's own real, working `download_jre25` release.
           draft: false
           prerelease: false
           files: |
