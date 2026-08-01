@@ -1,0 +1,215 @@
+name: Android OpenJDK 8
+
+# Task 2.1-2.4 (design D-jre8, tasks doc Phase 2). Sibling of jre21-android.yml,
+# adapted for the `buildjre8` reference branch, which is STRUCTURALLY
+# DIFFERENT from `buildjre17-21`/`judge/buildjre17-21-25` (script naming has
+# no numeric prefixes, e.g. `ci_build_arch_{abi}.sh` not
+# `1_ci_build_arch_{abi}.sh`, `clonejdk.sh` not `5_clonejdk.sh`).
+#
+# We build our OWN OpenJDK 8 for Android from source, per-ABI, in CI. We do
+# NOT redistribute AngelAuraMC's built JRE artifact — we build ours from the
+# same upstream OpenJDK source using their build *recipe* (checked out below,
+# pinned to a specific commit) as the reference/fork point. GPLv2 §3
+# source-correspondence is satisfied because we hold and build from the
+# source ourselves, instead of hotlinking or re-publishing someone else's
+# compiled output.
+#
+# Reference / fork source:
+#   repo:   AngelAuraMC/angelauramc-openjdk-build
+#   branch: buildjre8
+#   pinned commit: f03a5a05d76394bc3e91317e9ff4b8c21e5cb802
+#
+# This branch is jre8-only and has its own real, working CI workflow at
+# `.github/workflows/build.yml` — fetched and verified live (not guessed)
+# before writing this file. Deltas from jre21-android.yml, all confirmed
+# against that real workflow + `ci_build_global.sh`/`setdevkitpath.sh`:
+#
+#   - NO `TARGET_VERSION` env var: unlike buildjre17-21/judge's shared
+#     scripts, this branch's scripts hardcode jdk8/jre8 throughout
+#     (`clonejdk.sh` clones `jdk8u`-family repos, `tarjdk.sh` names archives
+#     `jre8-${TARGET_OS}-...`/`jdk8-${TARGET_OS}-...`). There is nothing to
+#     parameterize — this reference branch builds exactly one JDK version.
+#   - Bootstrap is Zulu 8 (`actions/setup-java@v4`, java-version: 8,
+#     distribution: zulu), NOT Temurin. The reference workflow's own step is
+#     labeled "set up JDK 1.7" but its `with:` config is `java-version: 8` —
+#     that label is a stale comment, not a real JDK 7 bootstrap.
+#   - Build step has no `1_` prefix: `bash "ci_build_arch_${{ matrix.abi }}.sh"`.
+#   - apt deps differ slightly from jre21/jre17/jre25: adds
+#     `gcc-multilib g++-multilib` (32-bit compilation support) and drops the
+#     extra libx11/libxext/libxrandr/libxrender/libxt packages jre21 installs,
+#     matching the reference workflow's own dependency list exactly.
+#   - No separate NDK-download workflow step: `ci_build_global.sh` (invoked
+#     internally by every `ci_build_arch_*.sh`) already does
+#     `wget -nc -nv ... dl.google.com/android/repository/...` then
+#     `./extractndk.sh` non-interactively — despite this branch's README
+#     claiming a manual EULA-gated download is required. Nothing to add here;
+#     the single build step already covers it.
+#   - Full 4-ABI matrix (aarch32, aarch64, x86, x86_64) — jre8 has no known
+#     32-bit-x86 exclusion issue (unlike jre25).
+#
+# Kept identical to jre21-android.yml (our contract, not upstream's):
+#   - publish-manifest job (abi_map, skip-missing-ABI tolerance, Python
+#     JreManifest/JreBundle generator, softprops/action-gh-release@v2), in-repo
+#     GITHUB_TOKEN publish, release tag `jre8-android`.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/jre8-android.yml'
+  schedule:
+    - cron: '0 3 1 */2 *'
+
+permissions:
+  contents: write
+
+env:
+  REFERENCE_REPO: AngelAuraMC/angelauramc-openjdk-build
+  REFERENCE_REF: f03a5a05d76394bc3e91317e9ff4b8c21e5cb802
+
+jobs:
+  build:
+    name: "Build OpenJDK 8 for Android ${{ matrix.abi }}"
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [aarch64, aarch32, x86, x86_64]
+
+    steps:
+      - name: Checkout reference build recipe (pinned commit)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REFERENCE_REPO }}
+          ref: ${{ env.REFERENCE_REF }}
+          path: reference-build
+
+      - name: Set up Zulu JDK 8 (build toolchain — bootstraps the cross-build itself)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '8'
+          distribution: zulu
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install autoconf python3 python-is-python3 unzip zip \
+            systemtap-sdt-dev gcc-multilib g++-multilib libxtst-dev \
+            libasound2-dev libelf-dev libfontconfig1-dev libx11-dev
+
+      - name: Build OpenJDK 8 for ${{ matrix.abi }}
+        working-directory: reference-build
+        # No `1_` prefix on this branch (script naming differs from
+        # buildjre17-21/judge). NDK r10e acquisition happens internally via
+        # ci_build_global.sh -> wget from dl.google.com; no separate step.
+        run: bash "ci_build_arch_${{ matrix.abi }}.sh"
+
+      - name: Compute sha256 (JreBundle contract — see app-launcher's commands/java.rs)
+        working-directory: reference-build
+        run: |
+          set -euo pipefail
+          jdk_archive=$(ls jdk8-android*.tar.xz)
+          jre_archive=$(ls jre8-android*.tar.xz)
+          sha256sum "$jdk_archive" > "$jdk_archive.sha256"
+          sha256sum "$jre_archive" > "$jre_archive.sha256"
+          echo "JDK_ARCHIVE=$jdk_archive" >> "$GITHUB_ENV"
+          echo "JRE_ARCHIVE=$jre_archive" >> "$GITHUB_ENV"
+
+      - name: Upload JDK build output (our own build, not AngelAuraMC's)
+        uses: actions/upload-artifact@v4
+        with:
+          name: "nerion-jdk8-${{ matrix.abi }}"
+          path: |
+            reference-build/${{ env.JDK_ARCHIVE }}
+            reference-build/${{ env.JDK_ARCHIVE }}.sha256
+
+      - name: Upload JRE build output (our own build, not AngelAuraMC's)
+        uses: actions/upload-artifact@v4
+        with:
+          name: "nerion-jre8-${{ matrix.abi }}"
+          path: |
+            reference-build/${{ env.JRE_ARCHIVE }}
+            reference-build/${{ env.JRE_ARCHIVE }}.sha256
+
+  publish-manifest:
+    name: Publish JreManifest
+    needs: build
+    runs-on: ubuntu-22.04
+    env:
+      RELEASE_TAG: jre8-android
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Download all JRE artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 'nerion-jre8-*'
+          path: artifacts
+
+      - name: Build JreManifest JSON
+        # Shape matches app-launcher's commands/java.rs JreManifest/JreBundle
+        # structs, unchanged from jre21-android.yml/jre17/jre25.
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+
+          abi_map = {
+              "aarch32": "Armv7",
+              "aarch64": "Arm64",
+              "x86": "X86",
+              "x86_64": "X86_64",
+          }
+          release_tag = "${{ env.RELEASE_TAG }}"
+          release_base = f"https://github.com/feeldev12/nerion-android-jdk-build/releases/download/{release_tag}"
+
+          bundles = []
+          for ci_abi, enum_variant in abi_map.items():
+              archive_dir = pathlib.Path("artifacts") / f"nerion-jre8-{ci_abi}"
+              archives = list(archive_dir.glob("jre8-android*.tar.xz"))
+              if not archives:
+                  continue
+              archive = archives[0]
+              sha256_file = archive.with_suffix(archive.suffix + ".sha256")
+              sha256 = sha256_file.read_text().split()[0] if sha256_file.exists() else hashlib.sha256(archive.read_bytes()).hexdigest()
+              bundles.append({
+                  "java_version": "8",
+                  "abi": enum_variant,
+                  "download_url": f"{release_base}/{archive.name}",
+                  "sha256": sha256,
+              })
+
+          manifest = {
+              "java_version": "8",
+              "build_id": "${{ github.run_id }}",
+              "bundles": bundles,
+          }
+          pathlib.Path("jre8-manifest.json").write_text(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Upload JreManifest (CI artifact, kept for debugging/history)
+        uses: actions/upload-artifact@v4
+        with:
+          name: nerion-jre8-manifest
+          path: jre8-manifest.json
+
+      - name: Publish JRE manifest + archives to a stable public GitHub Release
+        # Re-running this job re-uploads to the SAME tag, replacing assets in
+        # place (softprops/action-gh-release updates an existing release's
+        # assets rather than failing on tag collision).
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "Android OpenJDK 8 JRE bundles"
+          body: |
+            Self-built OpenJDK 8 Android JRE bundles — one per supported ABI,
+            plus the JreManifest these bundles are described by. Published by
+            this repo's own `.github/workflows/jre8-android.yml`
+            (run ${{ github.run_id }}).
+          draft: false
+          prerelease: false
+          files: |
+            jre8-manifest.json
+            artifacts/**/*.tar.xz
+            artifacts/**/*.tar.xz.sha256
