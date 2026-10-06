@@ -68,6 +68,12 @@ permissions:
   contents: write
 
 env:
+  # Link the JDK's own bundled zlib instead of the device's. On Linux OpenJDK defaults to the
+  # system zlib, which on Android is Chromium's and deflates differently on some phones: Forge's
+  # installer then gets different hashes for the jars it generates and fails with "Processor
+  # failed, invalid outputs" (client-1.20.1-...-slim.jar). Bundled zlib gives desktop's output.
+  # The trailing space matters: some recipes append to this with `+=`.
+  AUTOCONF_EXTRA_ARGS: "--with-zlib=bundled "
   REFERENCE_REPO: AngelAuraMC/angelauramc-openjdk-build
   REFERENCE_REF: f20acbd396601f88510ed98b7ac165c4e8c50730
 
@@ -113,6 +119,8 @@ jobs:
   publish-manifest:
     name: Publish JreManifest
     needs: build
+    # Only main publishes; a branch push just builds (and keeps the artifacts) for checking.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     # This repo IS the public target (design D2) — in-repo publish via the
     # built-in GITHUB_TOKEN, same as jre21-android.yml.
@@ -166,6 +174,9 @@ jobs:
           manifest = {
               "java_version": "25",
               "build_id": "${{ github.run_id }}",
+              # Bump when installed runtimes must be replaced (app-launcher ANDROID_JRE_REQUIRED_REVISION).
+              # 2: bundled zlib.
+              "nerion_revision": 2,
               "bundles": bundles,
           }
           pathlib.Path("jre25-manifest.json").write_text(json.dumps(manifest, indent=2))

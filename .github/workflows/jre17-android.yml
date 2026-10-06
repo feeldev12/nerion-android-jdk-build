@@ -47,6 +47,12 @@ permissions:
   contents: write
 
 env:
+  # Link the JDK's own bundled zlib instead of the device's. On Linux OpenJDK defaults to the
+  # system zlib, which on Android is Chromium's and deflates differently on some phones: Forge's
+  # installer then gets different hashes for the jars it generates and fails with "Processor
+  # failed, invalid outputs" (client-1.20.1-...-slim.jar). Bundled zlib gives desktop's output.
+  # The trailing space matters: some recipes append to this with `+=`.
+  AUTOCONF_EXTRA_ARGS: "--with-zlib=bundled "
   REFERENCE_REPO: AngelAuraMC/angelauramc-openjdk-build
   REFERENCE_REF: 4527b5a73dcf3f890b45eab4c6a91651ea28a5ea
   TARGET_VERSION: 17
@@ -67,6 +73,18 @@ jobs:
           repository: ${{ env.REFERENCE_REPO }}
           ref: ${{ env.REFERENCE_REF }}
           path: reference-build
+
+      - name: Pin the OpenJDK 17 source
+        # The recipe clones jdk17u's moving tip, and since 2026-09 its Android patches no
+        # longer apply there (config.sub). Pin the commit the published runtime was built
+        # from on 2026-08-01 (jdk-17.0.20.1) so rebuilds stay reproducible.
+        working-directory: reference-build
+        run: |
+          set -euo pipefail
+          pin='mkdir openjdk-17 \&\& git -C openjdk-17 init -q \&\& git -C openjdk-17 fetch -q --depth 1 https://github.com/openjdk/jdk17u 487e561b678073706598e6aaa261fd84131015ce \&\& git -C openjdk-17 checkout -q FETCH_HEAD'
+          sed -i "s#git clone --depth 1 https://github.com/openjdk/jdk17u openjdk-17#${pin}#" 5_clonejdk.sh
+          grep -q 487e561b678073706598e6aaa261fd84131015ce 5_clonejdk.sh
+          cat 5_clonejdk.sh
 
       - name: Set up JDK 17 (build toolchain — bootstraps the JDK 17 cross-build)
         uses: actions/setup-java@v4
@@ -118,6 +136,8 @@ jobs:
   publish-manifest:
     name: Publish JreManifest
     needs: build
+    # Only main publishes; a branch push just builds (and keeps the artifacts) for checking.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     # This repo IS the public target (design D2) — in-repo publish via the
     # built-in GITHUB_TOKEN, same as jre21-android.yml.
@@ -170,6 +190,9 @@ jobs:
           manifest = {
               "java_version": "17",
               "build_id": "${{ github.run_id }}",
+              # Bump when installed runtimes must be replaced (app-launcher ANDROID_JRE_REQUIRED_REVISION).
+              # 2: bundled zlib.
+              "nerion_revision": 2,
               "bundles": bundles,
           }
           pathlib.Path("jre17-manifest.json").write_text(json.dumps(manifest, indent=2))
