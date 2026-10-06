@@ -64,6 +64,12 @@ permissions:
   contents: write
 
 env:
+  # Link the JDK's own bundled zlib instead of the device's. On Linux OpenJDK defaults to the
+  # system zlib, which on Android is Chromium's and deflates differently on some phones: Forge's
+  # installer then gets different hashes for the jars it generates and fails with "Processor
+  # failed, invalid outputs" (client-1.20.1-...-slim.jar). Bundled zlib gives desktop's output.
+  # The trailing space matters: some recipes append to this with `+=`.
+  AUTOCONF_EXTRA_ARGS: "--with-zlib=bundled "
   REFERENCE_REPO: AngelAuraMC/angelauramc-openjdk-build
   REFERENCE_REF: f03a5a05d76394bc3e91317e9ff4b8c21e5cb802
 
@@ -134,6 +140,8 @@ jobs:
   publish-manifest:
     name: Publish JreManifest
     needs: build
+    # Only main publishes; a branch push just builds (and keeps the artifacts) for checking.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     env:
       RELEASE_TAG: jre8-android
