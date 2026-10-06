@@ -73,6 +73,18 @@ jobs:
           repository: ${{ env.REFERENCE_REPO }}
           ref: ${{ env.REFERENCE_REF }}
           path: reference-build
+
+      - name: Pin the OpenJDK 17 source
+        # The recipe clones jdk17u's moving tip, and since 2026-09 its Android patches no
+        # longer apply there (config.sub). Pin the commit the published runtime was built
+        # from on 2026-08-01 (the tip then) so rebuilds stay reproducible.
+        working-directory: reference-build
+        run: |
+          set -euo pipefail
+          pin='mkdir openjdk-17 \&\& git -C openjdk-17 init -q \&\& git -C openjdk-17 fetch -q --depth 1 https://github.com/openjdk/jdk17u beec9a7445e60709cebc2385bc5849aa1d5c20ea \&\& git -C openjdk-17 checkout -q FETCH_HEAD'
+          sed -i "s#git clone --depth 1 https://github.com/openjdk/jdk17u openjdk-17#${pin}#" 5_clonejdk.sh
+          grep -q beec9a7445e60709cebc2385bc5849aa1d5c20ea 5_clonejdk.sh
+          cat 5_clonejdk.sh
 
       - name: Set up JDK 17 (build toolchain — bootstraps the JDK 17 cross-build)
         uses: actions/setup-java@v4
